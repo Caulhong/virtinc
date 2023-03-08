@@ -15,6 +15,7 @@
 *  运行在docker的服务器
 */
 int main(){
+    printf("hh\n");
     int listen_fd;
     listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in my_addr;

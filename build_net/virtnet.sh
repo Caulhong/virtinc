@@ -16,7 +16,7 @@ function create_nodes(){
 	idx=0
 
 	for h in ${nodes[@]}; do
-		docker create --cap-add NET_ADMIN --name $h -p ${port_cast[$idx]}:${port_cast[$(($idx+1))]} mycontainer:v1.3
+		docker create --cap-add NET_ADMIN --name $h -p ${port_cast[$idx]}:${port_cast[$(($idx+1))]} -it mycontainer:v1.3 /bin/bash
 		idx=$(($idx+2))
 		echo create $h
 	done
@@ -61,7 +61,7 @@ function create_links(){
 		id[$i]=$(sudo docker inspect -f '{{.State.Pid}}' ${nodes[$i]})
 		ln -s /proc/${id[$i]}/ns/net /var/run/netns/${id[$i]}
 	done
-
+	echo "hh"
 	id[3]=${id[1]}
 
  	total=${#links[*]}
@@ -69,7 +69,8 @@ function create_links(){
 	idx=0
 
 	for ((i=0; i<$total; i=i+4)) do
-		#echo ${links[$i]}, ${links[$i+1]}, ${links[$i+2]}, ${links[$i+3]}
+		echo "here"
+		echo ${links[$i]}-${links[$i+1]}, ${links[$i+2]}-${links[$i+3]}
 		ip link add ${links[$i]}-${links[$i+1]} type veth peer name ${links[$i+2]}-${links[$i+3]}
 
 		ip link set ${links[$i]}-${links[$i+1]} netns ${id[$idx]}
@@ -88,7 +89,6 @@ function create_links(){
 function destroy_links(){
 	ip link del host1-iface1
 	ip link del host2-iface1
-	
 	for((i=0;i<3;i++));
 	do
 		id[$i]=$(sudo docker inspect -f '{{.State.Pid}}' ${nodes[$i]})
@@ -104,7 +104,7 @@ case $1 in
 		create_images
 		;;
 	"-cn")
-		#echo "create nodes"
+		echo "create nodes"
 		create_nodes
 		;;
 	"-rc")

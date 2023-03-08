@@ -174,7 +174,7 @@ void init_buffer(){
 
 int init_switch(){
 	// 初始化规则列表
-	parse_rulefile("src/switch.config");
+	parse_rulefile("switch.config");
 
 	// 初始化端口
 	port_num = 2;

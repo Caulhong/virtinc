@@ -2,6 +2,7 @@
 FROM ubuntu:20.04
 
 #RUN 执行以下命令 
+RUN ln -snf /usr/share/zoneinfo/$CONTAINER_TIMEZONE /etc/localtime && echo$CONTAINER_TIMEZONE > /etc/timezone
 RUN apt-get update && apt-get install sudo -y && sudo apt-get install vim \
     iproute2 traceroute autoconf make gcc libpcap-dev \
     openssh-server openssh-client ssh -y
