@@ -42,6 +42,7 @@ int parse_ip(char * str){
 int send_command(int conn_num, int rank){
     // 0是杀死子进程，-1是server退出，>0是conn_num
     // 根据rank建立连接
+    printf("hhhhhhhhhhhhhhhh %d,  %d\n", conn_num, rank);
     web_packet_t packet;
     bzero(&packet, sizeof(web_packet_t));
     if(conn_num == -1){
@@ -94,7 +95,7 @@ void recv_reply(int rank){
 
     char buf[RECV_SIZE] = "";
     struct timeval timeout = {3, 0}; 
-    setsockopt(sockfd[rank], SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(struct timeval)); 
+    //setsockopt(sockfd[rank], SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(struct timeval)); 
     int recv_bytes = recv(sockfd[rank], buf, sizeof(buf), MSG_WAITFORONE);
 
     if(recv_bytes > 0){
@@ -111,6 +112,7 @@ void recv_reply(int rank){
 }
 
 void stop(int signo){
+    exit(0);
     if(rank < 3){
         if(send_command(0, rank) < 0)
             printf("stop error\n");
@@ -127,6 +129,7 @@ int main(int argc, char * argv[]){
 
     // 参数解析
     if(argc < 4 || parse_ip(argv[2]) < 0){
+        printf("%d\n", argc);
         printf("Form error, please input again\n");
         printf("Right form: run -nodes host1_ip,switch_ip,host2_ip conn_num\n");
     }
@@ -138,7 +141,8 @@ int main(int argc, char * argv[]){
         docker_addr.sin_family = AF_INET;
         docker_addr.sin_port = htons(8000);
         docker_addr.sin_addr.s_addr = inet_addr(ip_str[i]);
-        connect(sockfd[i], (struct sockaddr *)&docker_addr, sizeof(docker_addr));
+        int cnt = connect(sockfd[i], (struct sockaddr *)&docker_addr, sizeof(docker_addr));
+        if(cnt < 0) printf("connect failed\n");
     }
 
     while(1){
@@ -150,7 +154,7 @@ int main(int argc, char * argv[]){
             }
         }
 
-        if(rank < 3){
+        if(rank < 3){   
             if(send_command(conn_num, rank) < 0)
                 printf("connect error");
             if(conn_num == -1)

@@ -32,7 +32,9 @@
 #define MAX_DELAY 0.5*CLOCKS_PER_SEC
 #define MAX_TASK_NUM 3
 #define MAX_SEND_BUF 20
-
+#define RECEIVE_BUF 20
+#define MAX_SWITCH_WND_SIZE 100
+#define LOSS 3
 /*******************************************************************************
  * put all data structures and function prototypes here in this file
  ******************************************************************************/
@@ -63,7 +65,7 @@ typedef struct __attribute__((packed)) INCP_Header
     uint16_t offset;
     uint8_t msg_head; // 第一个报文
     uint8_t msg_tail; // 最后一个报文
-    uint8_t pad;
+    uint8_t start_addr;
 }incp_header_t;//总长度4*int32
 
 /*******************************************************************************
@@ -115,6 +117,14 @@ struct _send_state{
     int last_seq_of_current_task; // 当前任务最后一个packet的序号
 };
 
+struct _switch_state
+{
+    uint8_t conn_id;
+    ip_pcb_t ack_window1[MAX_SWITCH_WND_SIZE];
+    int ack1;
+    ip_pcb_t ack_window2[MAX_SWITCH_WND_SIZE];
+    int ack2;
+};
 typedef struct _task task_t;
 struct _task
 {
@@ -123,6 +133,7 @@ struct _task
     int size;
     int left_size;
     char * src_ip, * dst_ip;
+    int start_addr;
     task_t * next;
 };
 
@@ -135,6 +146,7 @@ struct recv_state{
     int recv_until; // 按序接收到的最大seq_num
     void *addr; // 接收到的字符串地址
     int size; // recv_bytes长度
+    int start_addr;
     int last_seq_of_current_task; // 当前任务最后一个packet的序号
 };
 
@@ -159,6 +171,7 @@ typedef struct _rule rule_t;
 struct _rule
 {
     uint32_t src_ip; 
+    uint32_t dst_ip;
     uint32_t output_port;
     rule_t * next;
 };
@@ -173,19 +186,24 @@ int receive_packet_num;
 int send_packet_num;
 char * dev_name;
 int conn_num;
+int type;
+char original_buf[1000];
 FILE * fp;
 pthread_mutex_t fp_mutex;
-pthread_t receive_daemon, sender_process_daemon, receiver_process_daemon;;
+pthread_t receive_daemon, process_daemon, task_daemon, receiver_process_daemon, sender_process_daemon;
 pthread_t sender_list[MAX_CONN_NUM];
 pthread_t receiver_list[MAX_CONN_NUM];
 
 struct _send_state  send_state;
 struct recv_state recv_states[MAX_CONN_NUM];
-
+struct _switch_state switch_state;
 // 接收缓冲区和发送缓冲区(host)，ip报文格式
 ip_pcb_t * receive_buffer_head, * last_receive_buffer;
 ip_pcb_t * send_buffer_head, * last_send_buffer;
 pthread_mutex_t receive_buffer_mutex;//保护接收缓冲区，接收线程和处理线程都会访问这个buffer
+pthread_cond_t receive_buffer_empty;
+pthread_cond_t receive_buffer_full;
+int receive_empty_number;
 int full_num; // 发送缓冲区当前大小, 最大为MAX_SEND_BUF
 
 // 任务队列(包含一个空的头，从第二个开始才是任务)
@@ -200,24 +218,26 @@ int task_num; // 当前任务数, 最大为SLOT_NUM
  ******************************************************************************/
 
 //sender、receiver线程相关函数
+void computation(char* x, char* y, uint16_t length);
 void init_task_queue();
 int init_conn(int conn_id); 
-int listen_ipc(int conn_id);
-int send_ipc(int conn_id, char * text);
-int incp_send(int conn_id, void *addr, unsigned int size, char * src_ip, char * dst_ip); // 构造发送任务，加入队列，监听
-int incp_recv(int conn_id, void *addr, unsigned int size); // 构造recv_state，监听
+int listen_ipc(int conn_id, int msg_type);
+int send_ipc(int conn_id, char * text, int msg_type);
+int incp_send(int conn_id, void *addr, unsigned int size, int start_addr, char * src_ip, char * dst_ip); // 构造发送任务，加入队列，监听
+int incp_recv(int conn_id, void *addr); // 构造recv_state，监听
 
 void * run_receiver(void *arg);
+void * run_receiver1(void *arg);
 void * run_sender(void *arg);
 
 void run_host2(int argc, char** argv);
 void run_host1(int argc, char** argv);
-
+void run_host3(int argc, char** argv);
 //daemon线程相关函数
 void set_packet_processor();
 uint32_t open_pcap(char * dev_name, pcap_t ** pcap_handle);//返回网卡地址，也就是src_ip
 int check(const unsigned char *packet_content);
-void encode_incp(in_pcb_t * in_pcb , int seq_num, char * data, int payload_length, int offset);
+void encode_incp(in_pcb_t * in_pcb , int seq_num, char * data, int payload_length, int offset, int start_addr, int lastone);
 void encode_ip(ip_pcb_t * ip_pcb, char * src_ip, char * dst_ip, char * data);
 void decode_incp_ip(packet_info_t * packet_info, const unsigned char * data);
 void print_packet_info(packet_info_t * packet_info);

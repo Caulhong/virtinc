@@ -68,16 +68,17 @@ void parse_rule(rule_t * rule, char * rule_str){
 #if TEST
 	printf("parse_rule\n");
 #endif
-	int num1, num2, num3, num4, output_port;
-	char ipaddr[IP_ADDR_SIZE] = {};
+	int num1, num2, num3, num4, num5, num6, num7, num8, output_port;
+	char ipaddr[IP_ADDR_SIZE] = {}, ipaddr1[IP_ADDR_SIZE] = {};
 
-	sscanf(rule_str, "Match(%d.%d.%d.%d):Action(%d)", 
-			&num1, &num2, &num3, &num4, &output_port);
+	sscanf(rule_str, "Match(%d.%d.%d.%d-%d.%d.%d.%d):Action(%d)", 
+			&num1, &num2, &num3, &num4, &num5, &num6, &num7, &num8, &output_port);
 
 	sprintf(ipaddr, "%d.%d.%d.%d", num1, num2, num3, num4);
-
+	sprintf(ipaddr1, "%d.%d.%d.%d", num5, num6, num7, num8);
 	rule->output_port = output_port;
 	rule->src_ip = inet_addr(ipaddr);
+	rule->dst_ip = inet_addr(ipaddr1);
 	rule->next = NULL;
 }
 
@@ -150,6 +151,7 @@ void init_buffer(){
 			}
 			break;
 		case(SENDER):
+			receive_empty_number = RECEIVE_BUF;
 			full_num = 0;
 			send_buffer_head = malloc(sizeof(ip_pcb_t));
 			memset(send_buffer_head, 0, sizeof(ip_pcb_t));
@@ -160,8 +162,8 @@ void init_buffer(){
 			last_receive_buffer = receive_buffer_head;
 			break;
 		case(RECEIVER):
+			receive_empty_number = RECEIVE_BUF;
 			full_num = 0;
-
 			receive_buffer_head = malloc(sizeof(ip_pcb_t));
 			memset(receive_buffer_head, 0, sizeof(ip_pcb_t));
 			last_receive_buffer = receive_buffer_head;
@@ -177,7 +179,7 @@ int init_switch(){
 	parse_rulefile("switch.config");
 
 	// 初始化端口
-	port_num = 2;
+	port_num = 3;
 	init_port();
 
 	// 初始化包处理函数
@@ -202,17 +204,24 @@ void write_buffer(unsigned char *argument, const struct pcap_pkthdr *packet_head
 #if TEST
 	printf("run_writer\n");
 #endif
+#if TEST
+	ip_pcb_t* now_ip = (ip_pcb_t*)packet_content;
+	in_pcb_t* now_in = (in_pcb_t*)(now_ip->data);
+	struct in_addr ipaddr;
+	memcpy(&ipaddr, &(now_ip->ip_head.src_ip), 4);
+	printf("receive packet num: %d\n", receive_packet_num);
+	printf("ip address: %s\n", inet_ntoa(ipaddr));
+	printf("seq_numm: %d\n", now_in->incp_head.seq_num);
+	if(rand()%LOSS == 0)
+	{
+		printf("this packet lost when sending to switch\n");
+		return;
+	}
+#endif
 	pthread_mutex_lock(&packet_num_mutex);
 	receive_packet_num++;
 	
 	time_stamp = clock();
-
-#if TEST
-	printf("receive packet num: %d\n", receive_packet_num);
-#else
-	if(receive_packet_num % 50 == 0)
-		printf("receive_packet_num = %d\n", receive_packet_num);
-#endif
 	pthread_mutex_unlock(&packet_num_mutex);
 
 	//checksum检查
@@ -252,29 +261,35 @@ int match_and_send(ip_pcb_t * ip_pcb){
 	rule_t * prev_rule = action_list;
 	rule_t *curr_rule = prev_rule->next;
 	while(curr_rule != NULL){
-		if(curr_rule->src_ip == ip_head->src_ip){
+		if(curr_rule->src_ip == ip_head->src_ip && curr_rule->dst_ip == ip_head->dst_ip){
+			#if TEST
+				incp_header_t * incp_head = (incp_header_t *)(ip_pcb->data);
+				struct in_addr addr;
+				memcpy(&addr, &(ip_head->dst_ip), 4);
+				printf("send packet %d to %s: seq_num = %d\n", send_packet_num, inet_ntoa(addr), incp_head->seq_num);
+				if(rand()%LOSS == 0)
+				{
+					printf("this packet lost when sending from switch\n");
+					return 1;
+				}
+			#endif
 			int send_bytes = pcap_inject(pcap_handle_group[curr_rule->output_port-1], ip_pcb, ip_head->length);
 			if(send_bytes != ip_head->length){
 				perror("packet damage: ");
         	}
 		send_packet_num++;
-	
-#if TEST
-	incp_header_t * incp_head = (incp_header_t *)(ip_pcb->data);
-	struct in_addr addr;
-	memcpy(&addr, &(ip_head->dst_ip), 4);
-	printf("send packet %d to %s: seq_num = %d\n", send_packet_num, inet_ntoa(addr), incp_head->seq_num);
-#else
-	if(send_packet_num % 50 == 0)
-		printf("send_packet_num = %d\n", send_packet_num);
-
-#endif
-			return 1;
 		}
 		prev_rule = curr_rule;
 		curr_rule = prev_rule->next;
 	}
-	return -1;
+	return 1;
+}
+void computation(char* x, char* y, uint16_t length)
+{
+	for(int i = 0; i < length; ++i)
+	{
+		x[i]^=y[i];
+	}
 }
 
 //获得锁，遍历，读出，调整链表,释放锁
@@ -301,13 +316,39 @@ void * run_reader(void *arg){
 				last_used_slot = used_slot_head;
 			}
 			pthread_mutex_unlock(&slot_mutex);
-			int res = match_and_send(current);
-			if(res < 0){
-				printf("error packet: cannot found port to send: ");
-			
-				struct in_addr addr;
-				memcpy(&addr, &(((ip_header_t*)current)->src_ip), sizeof(uint32_t));
-				printf("src_ip = %s\n", inet_ntoa(addr));
+			incp_header_t * incp_head = (incp_header_t *)(current->data);
+			in_pcb_t * incp = (in_pcb_t*)(current->data);
+			ip_header_t* ip_head = (ip_header_t*)current;
+			int id = incp_head->seq_num;
+			if(ip_head->src_ip == inet_addr("10.0.0.1") && ip_head->dst_ip == inet_addr("0.0.0.0"))
+			{
+				switch_state.ack_window1[id] = *current;
+				switch_state.ack1 = 1;
+				if(switch_state.ack2 == 1)
+				{
+					in_pcb_t * incp_another = (in_pcb_t*)(switch_state.ack_window2[id].data);
+					computation(incp->data, incp_another->data, incp_head->payload_length);
+					current->ip_head.checksum = 0;
+					current->ip_head.checksum = compute_checksum(current, current->ip_head.length);
+					match_and_send(current);
+				}
+			}
+			else if(ip_head->src_ip == inet_addr("10.0.1.1") && ip_head->dst_ip == inet_addr("0.0.0.0"))
+			{
+				switch_state.ack_window2[id] = *current;
+				switch_state.ack2 = 1;
+				if(switch_state.ack1 == 1)
+				{
+					in_pcb_t * incp_another = (in_pcb_t*)(switch_state.ack_window1[id].data);
+					computation(incp->data, incp_another->data, incp_head->payload_length);
+					current->ip_head.checksum = 0;
+					current->ip_head.checksum = compute_checksum(current, current->ip_head.length);
+					match_and_send(current);
+				}
+			}
+			else
+			{
+				match_and_send(current);
 			}
 			memset(current, 0, sizeof(ip_pcb_t));
 			pthread_mutex_lock(&slot_mutex);
@@ -320,12 +361,12 @@ void * run_reader(void *arg){
 		{
 			printf("slot error: empty_num = %d current == NULL\n", empty_num);
 		}
-
 		pthread_cond_signal(&slot_empty);
 		pthread_mutex_unlock(&slot_mutex);
 	}
 	
 }
+
 
 //switch设置包处理器，开始收包
 void * run_writer(void *arg){

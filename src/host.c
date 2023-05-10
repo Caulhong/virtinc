@@ -59,7 +59,7 @@ uint32_t open_pcap(char * dev_name, pcap_t ** pcap_handle){
 }
 
 //将字符串包装成incp数据包
-void encode_incp(in_pcb_t * in_pcb , int seq_num, char * data, int payload_length, int offset){
+void encode_incp(in_pcb_t * in_pcb , int seq_num, char * data, int payload_length, int offset, int start_addr, int lastone){
 #if TEST
     printf("encode_incp\n");
 #endif
@@ -72,18 +72,13 @@ void encode_incp(in_pcb_t * in_pcb , int seq_num, char * data, int payload_lengt
 #endif
     }
 
-    if(payload_length < INCP_PAYLOAD)
-    {   
-        incp_head->msg_tail = 1;
-#if TEST
-        printf("last packet of the message\n");
-#endif
-    }
+    incp_head->msg_tail = lastone;
 
     incp_head->offset = offset;
     incp_head->ack_flag = 0;
     incp_head->payload_length = payload_length;
     incp_head->conn_id = current_task->conn_id;
+    incp_head->start_addr = start_addr;
     memcpy(in_pcb->data, data, payload_length);
     in_pcb->data[payload_length] = '\0';
 #if TEST
@@ -225,9 +220,14 @@ void write_receive_buffer(unsigned char *argument, const struct pcap_pkthdr *pac
     memcpy(current, packet_content, packet_header->len);
 
     pthread_mutex_lock(&receive_buffer_mutex);
+	while(receive_empty_number == 0){
+		pthread_cond_wait(&receive_buffer_empty, &receive_buffer_mutex);
+	}
     last_receive_buffer->next = current;
     last_receive_buffer = current;
     last_receive_buffer->next = NULL;
+    receive_empty_number--;
+    pthread_cond_signal(&receive_buffer_full);
     pthread_mutex_unlock(&receive_buffer_mutex);
 }
 
@@ -264,8 +264,9 @@ int reply_ack(in_pcb_t * in_pcb){
     receive_buffer_head->next = current->next;
     if(current->next == NULL)
         last_receive_buffer = receive_buffer_head;
+    receive_empty_number++;
+    pthread_cond_signal(&receive_buffer_empty);
     pthread_mutex_unlock(&receive_buffer_mutex);
-
     // 交换dst、src
     ip_header_t * ip_head = (ip_header_t *)current;
     uint32_t src_ip = ip_head->src_ip;
@@ -327,6 +328,7 @@ int process_receive_window(in_pcb_t * current){
 #if TEST
     printf("first packet of the sequence\n");
 #endif
+        current_state->start_addr = incp_head->start_addr;
         current_state->recv_until = incp_head->seq_num;
     }
     else if((incp_head->seq_num - current_state->recv_until > MAX_WND_SIZE) ||
@@ -338,7 +340,7 @@ int process_receive_window(in_pcb_t * current){
 
     if(incp_head->msg_tail == 1){// 记录任务的最后一个packet序号
 #if TEST
-        printf("last packet of the sequence: seq_num = %d conn_id = %d\n", current_state->conn_id, incp_head->seq_num);
+        printf("last packet of the sequence: seq_num = %d conn_id = %d\n", incp_head->seq_num ,current_state->conn_id);
 #endif   
         current_state->last_seq_of_current_task = incp_head->seq_num;    
     }
@@ -352,6 +354,7 @@ int process_receive_window(in_pcb_t * current){
     // payload写到缓冲区
     char * dst_addr = (char*)(current_state->addr)+incp_head->offset;
     memcpy(dst_addr, current->data, incp_head->payload_length);
+    current_state->size += incp_head->payload_length;
 
     // 窗口滑动
     int new_recv_until = current_state->recv_until + 1;
@@ -386,6 +389,8 @@ int process_send_window(){
     receive_buffer_head->next = current->next;
     if(receive_buffer_head->next == NULL)
         last_receive_buffer = receive_buffer_head;
+    receive_empty_number++;
+    pthread_cond_signal(&receive_buffer_empty);
     pthread_mutex_unlock(&receive_buffer_mutex);
 
     incp_header_t * incp_head = (incp_header_t *)(current->data);
@@ -500,6 +505,7 @@ void check_timeout(){
 void make_new_packet(){
     int tmp_seq = send_state.last_sent+1;
     while((tmp_seq - send_state.ack_until <= MAX_WND_SIZE) && (current_task->left_size > 0)){
+        if(type == 0 && tmp_seq > recv_states[current_task->conn_id].recv_until)break;
 #if TEST
     printf("\nmake_new_packet\n");
 #endif   
@@ -507,7 +513,7 @@ void make_new_packet(){
         int offset = tmp_seq * INCP_PAYLOAD;
         char * data = (char *)current_task->addr + offset;
         int payload_length;
-
+        int lastone;
         // 判断剩余数据长度
         if(current_task->left_size - INCP_PAYLOAD >= 0){
             payload_length = INCP_PAYLOAD;
@@ -516,10 +522,15 @@ void make_new_packet(){
             payload_length = current_task->left_size;
             current_task->left_size = 0;
         }
-
+        if(current_task->left_size == 0)lastone = 1;
+        else lastone = 0;
+        if(type == 0)
+        {
+            computation(data, recv_states[current_task->conn_id].addr + offset, payload_length);
+        }
         // 包装并插入缓冲区
         send_state.last_sent = tmp_seq;
-        encode_incp(&(send_state.ack_window[idx]), tmp_seq, data, payload_length, offset);
+        encode_incp(&(send_state.ack_window[idx]), tmp_seq, data, payload_length, offset, current_task->start_addr, lastone);
         int res = write_send_buffer(&(send_state.ack_window[idx]));
         if(res < 0){// 发送缓冲区已满
             break;
@@ -565,30 +576,20 @@ void * run_sender_process_daemon(){
 
     while(1){
         // 读取缓冲区ack包，进行窗口调整
-        while(receive_buffer_head->next != NULL){
-            // 查找对应连接并更新窗口状态
-            int conn_id;
-            if((conn_id = process_send_window()) < 0){
-                printf("process_send_window: drop error packet\n");
-            }else if(conn_id != MAX_CONN_NUM){
-                // 说明是最后一个包，返回conn_id
-                send_ipc(conn_id, "send finish");
-                free(current_task);
-                current_task = NULL;
-            }
+        pthread_mutex_lock(&receive_buffer_mutex);
+		while(receive_empty_number == RECEIVE_BUF){
+			pthread_cond_wait(&receive_buffer_full, &receive_buffer_mutex);
+		}
+        pthread_mutex_unlock(&receive_buffer_mutex);
+        int conn_id;
+        if((conn_id = process_send_window()) < 0){
+            printf("process_send_window: drop error packet\n");
+        }else if(conn_id != MAX_CONN_NUM){
+            // 说明是最后一个包，返回conn_id
+            send_ipc(conn_id, "send finish", 2);
+            free(current_task);
+            current_task = NULL;
         }
-        
-        // 取出task并进行连接初始化
-        set_task();
-        
-        // 检查超时报文
-        check_timeout();
-  
-        // 检查窗口剩余报文（填满窗口）
-        make_new_packet();
-
-        // 发送缓冲区所有报文
-        send_buffer_packet();
     }  
 }
 
@@ -598,7 +599,11 @@ void * run_receiver_process_daemon(){
     printf("run_receiver_process_daemon\n");
 #endif 
     while(1){
-        if(receive_buffer_head->next != NULL){
+            pthread_mutex_lock(&receive_buffer_mutex);
+            while(receive_empty_number == RECEIVE_BUF){
+                pthread_cond_wait(&receive_buffer_full, &receive_buffer_mutex);
+            }
+            pthread_mutex_unlock(&receive_buffer_mutex);
             in_pcb_t * current = malloc(sizeof(in_pcb_t));
 
             // 回复ack并获得incp报文
@@ -609,7 +614,49 @@ void * run_receiver_process_daemon(){
             int conn_id = process_receive_window(current);
             free(current);
             if(conn_id >= 0 && conn_id != MAX_CONN_NUM){
-                send_ipc(conn_id, "receive finish");
+                send_ipc(conn_id, "receive finish", 1);
+            }
+    }
+#if TEST
+    printf("process daemon end\n");
+#endif 
+}
+
+void * run_process_daemon(){
+#if TEST
+    printf("run_process_daemon\n");
+#endif 
+    while(1){
+        pthread_mutex_lock(&receive_buffer_mutex);
+		while(receive_empty_number == RECEIVE_BUF){
+			pthread_cond_wait(&receive_buffer_full, &receive_buffer_mutex);
+		}
+        ip_pcb_t* ip_packet = receive_buffer_head->next;
+        incp_header_t* incp_header = (incp_header_t*)(ip_packet->data);
+        pthread_mutex_unlock(&receive_buffer_mutex);
+        if(incp_header->ack_flag == 0){
+            in_pcb_t * current = malloc(sizeof(in_pcb_t));
+            // 回复ack并获得incp报文
+            if(reply_ack(current) < 0)
+                printf("send fail!\n");
+
+            // 查找对应连接并更新窗口状态
+            int conn_id = process_receive_window(current);
+            free(current);
+            if(conn_id >= 0 && conn_id != MAX_CONN_NUM){
+                send_ipc(conn_id, "receive finish", 1);
+            }
+        }
+        else
+        {
+            int conn_id;
+            if((conn_id = process_send_window()) < 0){
+                printf("process_send_window: drop error packet\n");
+            }else if(conn_id != MAX_CONN_NUM){
+                // 说明是最后一个包，返回conn_id
+                send_ipc(conn_id, "send finish", 2);
+                free(current_task);
+                current_task = NULL;
             }
         }
     }
@@ -617,7 +664,23 @@ void * run_receiver_process_daemon(){
     printf("process daemon end\n");
 #endif 
 }
+void * run_task_daemon()
+{
+    while(1)
+    {
+        set_task();
+        
+        // 检查超时报文
+        check_timeout();
+  
+        // 检查窗口剩余报文（填满窗口）
+        make_new_packet();
 
+        // 发送缓冲区所有报文
+        send_buffer_packet();
+        usleep(100000);
+    }
+}
 // 建立连接，初始化连接状态
 int init_conn(int conn_id){
     // conn_id对应数组序号
@@ -628,16 +691,12 @@ int init_conn(int conn_id){
         send_state.ack_until = -1;
         send_state.last_seq_of_current_task = -1;
         memset(send_state.ack_window, 0, sizeof(send_state.ack_window));
-
     }else if(rank == RECEIVER){
         recv_states[conn_id].conn_id = conn_id;
         recv_states[conn_id].recv_until = -1;
         recv_states[conn_id].last_seq_of_current_task = -1;
         recv_states[conn_id].addr = NULL;
         recv_states[conn_id].size = 0;
-    }else{
-        printf("error type\n");
-        clean_exit();
     }
     return 0;
 }
@@ -657,7 +716,7 @@ void init_task_queue(){
 }
 
 // 监听消息队列，消息类型为conn_id+1
-int listen_ipc(int conn_id){
+int listen_ipc(int conn_id, int msg_type){
 #if TEST
     printf("listen_ipc: connid = %d\n", conn_id);
 #endif
@@ -674,7 +733,7 @@ int listen_ipc(int conn_id){
 
     ipc_msg_t msg;
     memset(&msg, 0, sizeof(msg));
-    msg.msgtype = conn_id + 1;
+    msg.msgtype = msg_type;
 
     // msgflg参数设置为0，阻塞式接收消息
     int res = msgrcv(msgqid, &msg, IPC_MSG_SIZE, msg.msgtype, 0);
@@ -687,12 +746,11 @@ int listen_ipc(int conn_id){
 
     printf("type = %ld, message = %s\n", msg.msgtype, msg.msgtext) ;
 
-
     return 0;
 }
 
 // 向消息队列发送消息，消息类型为conn_id+1
-int send_ipc(int conn_id, char * text){
+int send_ipc(int conn_id, char * text, int msg_type){
 #if TEST
     printf("send_ipc\n");
 #endif
@@ -706,7 +764,7 @@ int send_ipc(int conn_id, char * text){
 
     ipc_msg_t msg;
     memset(&msg, 0, sizeof(msg));
-    msg.msgtype = conn_id + 1;
+    msg.msgtype =msg_type;
     strcpy(msg.msgtext, text);
     // msgflg参数设置为0，阻塞式发送消息
     int res = msgsnd(msgqid, &msg, IPC_MSG_SIZE, 0);
@@ -724,7 +782,7 @@ int send_ipc(int conn_id, char * text){
 }
 
 // 构造发送任务，加入队列，监听
-int incp_send(int conn_id, void *addr, unsigned int size, char * src_ip, char * dst_ip){
+int incp_send(int conn_id, void *addr, unsigned int size, int start_addr, char * src_ip, char * dst_ip){
 #if TEST
     printf("incp_send!\n");
 #endif
@@ -738,7 +796,7 @@ int incp_send(int conn_id, void *addr, unsigned int size, char * src_ip, char * 
     new_task->left_size = size;
     new_task->src_ip = src_ip;
     new_task->dst_ip = dst_ip;
-
+    new_task->start_addr = start_addr;
 #if TEST
     printf("insert task queue\n");
 #endif
@@ -759,29 +817,36 @@ int incp_send(int conn_id, void *addr, unsigned int size, char * src_ip, char * 
     printf("wait for reply\n");
 #endif
     // 监听等待回复
-    return listen_ipc(conn_id);
+    return listen_ipc(conn_id, 2);
 }
 
 // 构造recv_state，监听
-int incp_recv(int conn_id, void *addr, unsigned int size){
+int incp_recv(int conn_id, void *addr){
 #if TEST
     printf("incp_recv\n");
 #endif
-    init_conn(conn_id);
-
+    if(type == 0)
+    {
+        recv_states[conn_id].conn_id = conn_id;
+        recv_states[conn_id].recv_until = -1;
+        recv_states[conn_id].last_seq_of_current_task = -1;
+        recv_states[conn_id].addr = NULL;
+        recv_states[conn_id].size = 0;
+    }
+    else init_conn(conn_id);
     recv_states[conn_id].addr = addr;
-    recv_states[conn_id].size = size;
-
-    return listen_ipc(conn_id);
+    return listen_ipc(conn_id, 1);
 }
 
 void host_end(){
     if(rank == 0){
-        pthread_kill(sender_process_daemon, SIGALRM);
+        pthread_kill(process_daemon, SIGALRM);
         pthread_kill(receive_daemon, SIGALRM);
+        pthread_kill(task_daemon, SIGALRM);
     }else if(rank == 2){
-        pthread_kill(receiver_process_daemon, SIGALRM);
+        pthread_kill(process_daemon, SIGALRM);
         pthread_kill(receive_daemon, SIGALRM);
+        pthread_kill(task_daemon, SIGALRM);
     }else if(rank == 1){
         for(int i = 0; i < writer_num; ++i){
             pthread_kill(writer_list[i], SIGALRM);
@@ -794,20 +859,21 @@ void daemon_end(){
     pthread_exit(NULL);
 }
 
-// host2运行：初始化recv_state, 运行receive线程
-void run_host2(int argc, char** argv){
+// host3运行：初始化recv_state, 运行receive线程
+void run_host3(int argc, char** argv){
     signal(SIGALRM, daemon_end); 
     signal(SIGTERM, host_end);
     // 连接数
     conn_num = atoi(argv[2]);
 
     // pcap初始化
-    dev_name = "host2-iface1";
+    dev_name = "host3-iface1";
     open_pcap(dev_name, &pcap_handle);
 
     init_buffer();
     pthread_mutex_init(&receive_buffer_mutex, NULL);
-
+    pthread_cond_init(&receive_buffer_empty, NULL);
+	pthread_cond_init(&receive_buffer_full, NULL);
     // 运行处理线程和接收线程
     int res = pthread_create(&receiver_process_daemon, NULL, run_receiver_process_daemon, NULL);
     if(res < 0){
@@ -840,7 +906,6 @@ void run_host2(int argc, char** argv){
     printf("pthread_join receiver_list finish\n");
 #endif
   
-
     pthread_join(receiver_process_daemon, NULL);
     pthread_join(receive_daemon, NULL);
 #if TEST
@@ -855,9 +920,7 @@ void run_host2(int argc, char** argv){
 void run_host1(int argc, char** argv){
     signal(SIGALRM, daemon_end); 
     signal(SIGTERM, host_end);
-    char * src = "10.0.0.1";
-    char * dst = "10.0.1.1";
-    char * file_name = "text.txt";
+    char * file_name = "test1.dat";
 
     // pcap初始化
     dev_name = "host1-iface1";
@@ -868,14 +931,147 @@ void run_host1(int argc, char** argv){
 
     //buffer
     init_buffer();
-
     // 连接数
     conn_num = atoi(argv[2]);
-    
-
+    type = atoi(argv[3]);
+    char src[10], dst[10];
+    if(type == 0)
+    {
+        strcpy(src, "10.0.0.1");
+        strcpy(dst, "10.0.2.1");
+    }
+    else if(type == 1)
+    {
+        strcpy(src, "10.0.0.1");
+        strcpy(dst, "0.0.0.0");
+    }
+    else
+    {
+        printf("invalid argument\n");
+        return;
+    }
     // 锁和条件变量
     pthread_mutex_init(&fp_mutex, NULL);
     pthread_mutex_init(&receive_buffer_mutex, NULL);
+    pthread_cond_init(&receive_buffer_empty, NULL);
+	pthread_cond_init(&receive_buffer_full, NULL);
+    pthread_mutex_init(&task_mutex, NULL);
+    pthread_cond_init(&task_queue_empty, NULL);
+	pthread_cond_init(&task_queue_full, NULL);
+
+
+    // 运行处理线程和接收线程
+    int res;
+    res = pthread_create(&task_daemon, NULL, run_task_daemon, NULL);
+    if(res < 0){
+        printf("pthread_create error: %d\n", res);
+        clean_exit();
+    }
+    res = pthread_create(&receive_daemon, NULL, run_receive_daemon, NULL);
+    if(res < 0){
+        printf("pthread_create error: %d\n", res);
+        clean_exit();
+    }
+    // 运行sender_list
+    struct arg_t arg_group[MAX_CONN_NUM] = {};
+    for(int i = 0; i < conn_num; ++i){ 
+        arg_group[i].conn_id = i;
+        strcpy(arg_group[i].file_name, file_name); 
+        strcpy(arg_group[i].src_ip, src);
+        strcpy(arg_group[i].dst_ip, dst);    
+        res = pthread_create(&(sender_list[i]), NULL, run_sender, &(arg_group[i]));
+        if(res < 0){
+            printf("pthread_create error: %d\n", res);
+            clean_exit();
+        }
+    }
+    if(type == 0)
+    {
+        res = pthread_create(&process_daemon, NULL, run_process_daemon, NULL);
+        if(res < 0){
+            printf("pthread_create error: %d\n", res);
+            clean_exit();
+        }
+
+        int conn_group[MAX_CONN_NUM]={};
+        for(int i = 0; i < conn_num; ++i){
+            // 初始化recv_state
+            // 运行receive线程
+            conn_group[i] = i;
+            int res = pthread_create(&(receiver_list[i]), NULL, run_receiver1, &(conn_group[i]));
+            if(res < 0){
+                printf("pthread_create error: %d\n", res);
+                clean_exit();
+            }
+        }
+    }
+    else 
+    {
+        res = pthread_create(&sender_process_daemon, NULL, run_sender_process_daemon, NULL);
+        if(res < 0){
+            printf("pthread_create error: %d\n", res);
+            clean_exit();
+        }
+    }
+    //回收线程和内存
+    if(type == 0)
+    {
+        for(int i = 0; i < conn_num; ++i){
+            pthread_join(receiver_list[i], NULL);
+        }
+        pthread_join(process_daemon, NULL);
+    }
+    else pthread_join(sender_process_daemon, NULL);
+    for(int i = 0; i < conn_num; ++i){
+        pthread_join(sender_list[i], NULL);
+    }
+#if TEST
+    printf("pthread_join sender_list finish\n");
+#endif
+   
+    pthread_join(task_daemon, NULL);
+    pthread_join(receive_daemon, NULL);
+
+#if TEST
+    printf("pthread_join daemon finish\n");
+#endif
+    clean_exit();
+}
+
+
+void run_host2(int argc, char** argv){
+    signal(SIGALRM, daemon_end); 
+    signal(SIGTERM, host_end);
+    char * file_name = "test2.dat";
+
+    // pcap初始化
+    dev_name = "host2-iface1";
+    open_pcap(dev_name, &pcap_handle);
+
+    //task_queue
+    init_task_queue();
+
+    //buffer
+    init_buffer();
+    // 连接数
+    conn_num = atoi(argv[2]);
+    type = atoi(argv[3]);
+    char src[10], dst[10];
+    if(type == 1)
+    {
+        strcpy(src, "10.0.1.1");
+        strcpy(dst, "0.0.0.0");
+    }
+    else
+    {
+        strcpy(src, "10.0.1.1");
+        strcpy(dst, "10.0.0.1");
+    }
+    // 锁和条件变量
+    pthread_mutex_init(&fp_mutex, NULL);
+    pthread_mutex_init(&receive_buffer_mutex, NULL);
+    pthread_cond_init(&receive_buffer_empty, NULL);
+	pthread_cond_init(&receive_buffer_full, NULL);
     pthread_mutex_init(&task_mutex, NULL);
     pthread_cond_init(&task_queue_empty, NULL);
 	pthread_cond_init(&task_queue_full, NULL);
@@ -883,6 +1079,11 @@ void run_host1(int argc, char** argv){
 
     // 运行处理线程和接收线程
     int res = pthread_create(&sender_process_daemon, NULL, run_sender_process_daemon, NULL);
+    if(res < 0){
+        printf("pthread_create error: %d\n", res);
+        clean_exit();
+    }
+    res = pthread_create(&task_daemon, NULL, run_task_daemon, NULL);
     if(res < 0){
         printf("pthread_create error: %d\n", res);
         clean_exit();
@@ -915,7 +1116,7 @@ void run_host1(int argc, char** argv){
     printf("pthread_join sender_list finish\n");
 #endif
    
-
+    pthread_join(task_daemon, NULL);
     pthread_join(sender_process_daemon, NULL);
     pthread_join(receive_daemon, NULL);
 
@@ -925,72 +1126,97 @@ void run_host1(int argc, char** argv){
     clean_exit();
 }
 
+
 // 循环阻塞
 void * run_receiver(void * arg){
 #if TEST
     printf("run_receiver\n");
 #endif
-    // 接收字符串的大小
-    FILE * fp = fopen("text.txt", "r");
-    fseek(fp, 0, SEEK_END);
-    int file_size = ftell(fp)+1;
-    char * buf = (char *)malloc(file_size);
-    memset(buf, 0, file_size);
-    fclose(fp);
-
-    // 接收信息
+    char buf[1000];
+    memset(buf, 0, sizeof(buf));
     int conn_id = *((int*)arg);
-    int res = incp_recv(conn_id, buf, file_size);
+    int res = incp_recv(conn_id, buf);
+    int start_addr = recv_states[conn_id].start_addr;
+    int size = recv_states[conn_id].size;
     if(res < 0){
         printf("recv error\n");
     }else{
-
-        buf[file_size-1] = '\0';
         // 写到对应文件中去:output_($connid).txt
+        printf("%d %d\n", start_addr, size);
         char output_file[NAME_SIZE]={};
-        sprintf(output_file, "output_%d.txt", conn_id);
-        fp = fopen(output_file, "w");
-        fwrite(buf, sizeof(char), file_size, fp);
-        
+        sprintf(output_file, "output_%d.dat", conn_id);
+        fp = fopen(output_file, "rb+");
+        fseek(fp, start_addr, SEEK_SET);
+        fwrite(buf, sizeof(char), size, fp);
+        fseek(fp, 0, SEEK_END);
+        int file_size = ftell(fp);
+        printf("%d\n", file_size);
         fclose(fp);
         printf("receiver end\n");
     }
 
 }
 
+void * run_receiver1(void * arg){
+#if TEST
+    printf("run_receiver1\n");
+#endif
+    int conn_id = *((int*)arg);
+    int res = incp_recv(conn_id, original_buf);
+}
 // 从文件中读取字符串，调用send进入发送阻塞
 void * run_sender(void * arg){
-
     struct arg_t * argument = (struct arg_t *)arg;
-
+    clock_t start, end;
+    start = clock();
 #if TEST
     printf("run_sender\n");
     printf("file_name:%s\n", argument->file_name);
 #endif
-
-    pthread_mutex_lock(&fp_mutex);
-    fp = fopen(argument->file_name, "r");
-    if(fp == NULL){
-        perror("run_sender(): ");
-        clean_exit();
-    }
-
-    fseek(fp, 0, SEEK_END);
-    int file_size = ftell(fp);
-    char * buf = (char *)malloc(file_size+1);
-    memset(buf, 0, file_size);
-    rewind(fp);
-
-    if((fread(buf, sizeof(char), file_size, fp)) !=  file_size){
-        perror("fread error!\n");
-    }
-    fclose(fp);
-    pthread_mutex_unlock(&fp_mutex);
-
-    int res = incp_send(argument->conn_id, buf, file_size, argument->src_ip, argument->dst_ip);
-    if(res < 0){
-        printf("send error!\n");
-    }else{
-        printf("sender end\n");
+    char buf[1000];
+    key_t key = ftok(".", argument->conn_id);
+    int msgqid = msgget(key, IPC_CREAT|S_IRUSR|S_IWUSR|S_IRGRP|S_IWGRP|S_IROTH|S_IWOTH);
+    struct _ipc_msg msg;
+    while(1)
+    {
+        msgrcv(msgqid, &msg, IPC_MSG_SIZE, 1, 0);
+        int start_addr, size, operation;
+        sscanf(msg.msgtext, "%d %d %d", &start_addr, &size, &operation);
+        if(operation == -1)
+        {
+            memset(buf, 0, size);
+            pthread_mutex_lock(&fp_mutex);
+            fp = fopen(argument->file_name, "rb+");
+            fseek(fp, start_addr, SEEK_SET);
+            fread(buf, sizeof(char), size, fp);
+            fclose(fp);
+            pthread_mutex_unlock(&fp_mutex);
+        }
+        else if(operation == 0 || operation == 1)
+        {
+            if(operation == 0)
+            {
+                memset(buf, 0, size);
+            }
+            else if(operation == 1)
+            {
+                memset(buf, -1, size);
+            }
+            pthread_mutex_lock(&fp_mutex);
+            fp = fopen(argument->file_name, "rb+");
+            fseek(fp, start_addr, SEEK_SET);
+            fwrite(buf, sizeof(char), size, fp);
+            fclose(fp);
+            pthread_mutex_unlock(&fp_mutex);
+        }
+        int res = incp_send(argument->conn_id, buf, size, start_addr, argument->src_ip, argument->dst_ip);
+        if(res < 0){
+            printf("send error!\n");
+        }else{
+            end = clock();
+            printf("TIME CONSUMING:  %ld\n", end - start);
+            printf("sender end\n");
+        }
     }
 }
+
